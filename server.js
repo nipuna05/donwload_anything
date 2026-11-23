@@ -3,7 +3,8 @@ import WebTorrent from 'webtorrent';
 import ffmpegPath from 'ffmpeg-static';
 import { spawn } from 'node:child_process';
 import { createWriteStream, existsSync } from 'node:fs';
-import { mkdir, readdir, stat, unlink } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile, stat, unlink, access, constants as fsc } from 'node:fs/promises';
+import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,17 +12,28 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const DOWNLOADS = path.join(root, 'downloads');
-const YTDLP = path.join(root, 'bin', process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+const DATA_DIR = process.env.DL_DATA || root; // where config.json lives
+const BIN_DIR = process.env.DL_BIN || path.join(root, 'bin');
+const YTDLP = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '127.0.0.1'; // local only, never exposed to the network
+const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
+const DEFAULT_DOWNLOADS = process.env.DL_DOWNLOADS || path.join(root, 'downloads');
 
-await mkdir(DOWNLOADS, { recursive: true });
+// ---------- settings (saved download folder) ----------
+let config = {};
+try { config = JSON.parse(await readFile(CONFIG_FILE, 'utf8')); } catch { /* first run */ }
+let DOWNLOADS = path.resolve(config.downloadDir || DEFAULT_DOWNLOADS);
+try { await mkdir(DOWNLOADS, { recursive: true }); }
+catch { DOWNLOADS = path.resolve(DEFAULT_DOWNLOADS); await mkdir(DOWNLOADS, { recursive: true }); }
+
+const isLoopback = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
 
 const app = express();
 app.use(express.json({ limit: '100kb' }));
 app.use(express.static(path.join(root, 'public')));
-app.use('/files', express.static(DOWNLOADS, { dotfiles: 'deny', index: false }));
+// always serves from the *current* download folder
+app.use('/files', (req, res, next) => express.static(DOWNLOADS, { dotfiles: 'deny', index: false })(req, res, next));
 
 /** @type {Map<string, any>} */
 const jobs = new Map();
@@ -173,7 +185,46 @@ app.post('/api/cancel/:id', (req, res) => {
   res.json(publicJob(job));
 });
 
-app.get('/api/jobs', (_req, res) => res.json([...jobs.values()].map(publicJob)));
+// ---------- settings API (loopback only: a remote device must not choose folders on the PC) ----------
+app.get('/api/settings', (_req, res) => res.json({ downloadDir: DOWNLOADS }));
+
+app.post('/api/settings', async (req, res) => {
+  if (!isLoopback(req)) return res.status(403).json({ error: 'Settings can only be changed on the PC itself.' });
+  const dir = String(req.body?.downloadDir || '').trim();
+  if (!dir || !path.isAbsolute(dir)) return res.status(400).json({ error: 'Enter a full folder path, e.g. D:\\Downloads' });
+  try {
+    await mkdir(dir, { recursive: true });
+    await access(dir, fsc.W_OK);
+  } catch (e) { return res.status(400).json({ error: `Cannot use that folder: ${e.code || e.message}` }); }
+  DOWNLOADS = path.resolve(dir);
+  config.downloadDir = DOWNLOADS;
+  await writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
+  res.json({ downloadDir: DOWNLOADS });
+});
+
+// folder browser for the "Browse" button (loopback only)
+app.get('/api/browse', async (req, res) => {
+  if (!isLoopback(req)) return res.sendStatus(403);
+  const p = String(req.query.path || '');
+  try {
+    if (!p) { // top level: drives on Windows, home on others
+      if (process.platform !== 'win32') return res.json({ path: os.homedir(), parent: null, dirs: await listDirs(os.homedir()) });
+      const drives = [];
+      for (let c = 65; c <= 90; c++) { const d = String.fromCharCode(c) + ':\\'; try { await access(d); drives.push({ name: d, path: d }); } catch { /* no drive */ } }
+      return res.json({ path: '', parent: null, dirs: drives });
+    }
+    const abs = path.resolve(p);
+    const parent = path.dirname(abs) === abs ? '' : path.dirname(abs);
+    res.json({ path: abs, parent, dirs: await listDirs(abs) });
+  } catch (e) { res.status(400).json({ error: e.code || e.message }); }
+});
+async function listDirs(dir) {
+  const items = await readdir(dir, { withFileTypes: true });
+  return items.filter((e) => e.isDirectory() && !e.name.startsWith('.') && !e.name.startsWith('$'))
+    .map((e) => ({ name: e.name, path: path.join(dir, e.name) })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+app.get('/api/jobs',(_req, res) => res.json([...jobs.values()].map(publicJob)));
 
 app.get('/api/files', async (_req, res) => {
   const out = [];
@@ -200,5 +251,8 @@ app.get('/api/events', (req, res) => {
   clients.add(res);
   req.on('close', () => clients.delete(res));
 });
+
+// clean JSON errors instead of HTML stack traces
+app.use((err, _req, res, _next) => res.status(err.status || 500).json({ error: err.type === 'entity.parse.failed' ? 'Invalid JSON' : 'Server error' }));
 
 app.listen(PORT, HOST, () => console.log(`Downloader running at http://${HOST}:${PORT}`));
