@@ -27,6 +27,9 @@
   .done .bar > i { background:var(--ok); } .error .meta { color:var(--err); }
   a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
   .empty { color:var(--muted); }
+  dialog { border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--text); width:min(520px,92vw); padding:16px; }
+  dialog::backdrop { background:rgba(0,0,0,.45); }
+  .dirrow { padding:8px 12px; cursor:pointer; border-top:1px solid var(--line); } .dirrow:first-child { border-top:0; } .dirrow:hover { background:var(--bg); }
 </style>
 </head>
 <body>
@@ -47,6 +50,23 @@
     <div class="hint">Only download content you own or have the right to download. Files are saved in the <b>downloads</b> folder.</div>
     <div id="msg"></div>
   </form>
+
+  <section class="card">
+    <h2>Save location</h2>
+    <div class="row">
+      <input type="text" id="dir" placeholder="D:\Downloads" autocomplete="off">
+      <button type="button" id="browse">Browse…</button>
+      <button type="button" id="saveDir" class="primary">Save</button>
+    </div>
+    <div class="hint" id="dirMsg">Downloads on the PC are saved here.</div>
+  </section>
+
+  <dialog id="picker">
+    <div class="top"><b>Choose a folder</b><button type="button" class="small" id="pickCancel">Close</button></div>
+    <div class="meta" id="pickPath" style="margin:6px 0;word-break:break-all"></div>
+    <div id="pickList" style="max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px"></div>
+    <div class="row" style="margin-top:10px;justify-content:flex-end"><button type="button" class="primary" id="pickUse">Use this folder</button></div>
+  </dialog>
 
   <section class="card"><h2>Active &amp; recent</h2><div id="jobs" class="empty">Nothing yet.</div></section>
   <section class="card"><h2>Saved files</h2><div id="files" class="empty">No files.</div></section>
@@ -94,6 +114,38 @@ document.addEventListener('click', async (e) => {
   if (c) await fetch('/api/cancel/' + c, { method: 'POST' });
   if (d && confirm('Delete ' + d + '?')) { await fetch('/api/files?name=' + encodeURIComponent(d), { method: 'DELETE' }); loadFiles(); }
 });
+
+// ---- save location ----
+async function loadSettings() {
+  const s = await (await fetch('/api/settings')).json();
+  $('dir').value = s.downloadDir;
+}
+async function saveDir() {
+  const r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ downloadDir: $('dir').value }) });
+  const d = await r.json();
+  $('dirMsg').style.color = r.ok ? 'var(--ok)' : 'var(--err)';
+  $('dirMsg').textContent = r.ok ? 'Saved. New downloads go to: ' + d.downloadDir : d.error;
+  if (r.ok) { $('dir').value = d.downloadDir; loadFiles(); }
+}
+let pickCur = '';
+async function browseTo(p) {
+  const r = await fetch('/api/browse?path=' + encodeURIComponent(p));
+  if (!r.ok) { $('pickPath').textContent = 'Cannot open that folder (only works on the PC itself).'; return; }
+  const d = await r.json(); pickCur = d.path;
+  $('pickPath').textContent = d.path || 'Drives';
+  $('pickUse').disabled = !d.path;
+  const rows = [];
+  if (d.parent !== null && d.path) rows.push(`<div class="dirrow" data-p="${esc(d.parent)}">⬆ ..</div>`);
+  d.dirs.forEach((x) => rows.push(`<div class="dirrow" data-p="${esc(x.path)}">📁 ${esc(x.name)}</div>`));
+  $('pickList').innerHTML = rows.join('') || '<div class="dirrow">No sub-folders</div>';
+}
+$('saveDir').onclick = saveDir;
+$('browse').onclick = () => { $('picker').showModal(); browseTo($('dir').value ? $('dir').value : ''); };
+$('pickCancel').onclick = () => $('picker').close();
+$('pickUse').onclick = () => { $('dir').value = pickCur; $('picker').close(); saveDir(); };
+$('pickList').onclick = (e) => { const p = e.target.closest('.dirrow')?.dataset.p; if (p !== undefined) browseTo(p); };
+loadSettings();
 
 fetch('/api/jobs').then((r) => r.json()).then((l) => { l.forEach((j) => jobs.set(j.id, j)); renderJobs(); });
 const es = new EventSource('/api/events');
