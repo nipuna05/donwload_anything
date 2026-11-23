@@ -5,6 +5,8 @@ import { spawn } from 'node:child_process';
 import { createWriteStream, existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile, stat, unlink, access, constants as fsc } from 'node:fs/promises';
 import os from 'node:os';
+import net from 'node:net';
+import dns from 'node:dns/promises';
 import crypto, { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,10 +53,35 @@ const tokenOf = (req) => (req.headers.authorization || '').replace(/^Bearer\s+/i
 const hasValidToken = (req) => { const t = tokenOf(req); return !!t && (config.tokens || []).includes(sha(t)); };
 const authed = (req) => isLocal(req) || hasValidToken(req);
 
-if (!config.pin) { config.pin = newPin(); await saveConfig(); }
+// PIN: set DL_PIN on a server (min 8 chars); otherwise one is generated and kept in config.json
+const PIN_FROM_ENV = !!process.env.DL_PIN;
+if (PIN_FROM_ENV) {
+  const p = process.env.DL_PIN.trim().toUpperCase().replace(/[\s-]/g, '');
+  if (p.length < 8) throw new Error('DL_PIN must be at least 8 characters');
+  config.pin = p;
+} else if (!config.pin) { config.pin = newPin(); await saveConfig(); }
 config.tokens ||= [];
 
-let failedLogins = []; // global lockout: 10 wrong PINs in 10 minutes blocks logins for the rest of that window
+// Login throttling: 10 wrong PINs per client IP per 10 min, and 100 across everyone (distributed guessing).
+const clientIp = (req) => req.headers['cf-connecting-ip'] || String(req.headers['x-forwarded-for'] || '').split(',').pop().trim() || req.socket.remoteAddress;
+const failedByIp = new Map(); let failedAll = [];
+const recent = (list, now) => list.filter((t) => now - t < 600000);
+
+// Optional SSRF guard for servers (DL_BLOCK_PRIVATE=1): refuse links that resolve to private/loopback/link-local addresses.
+const BLOCK_PRIVATE = process.env.DL_BLOCK_PRIVATE === '1';
+function isPrivateIp(ip) {
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (net.isIPv6(ip)) return ip === '::1' || ip === '::' || /^f[cd]/i.test(ip) || /^fe[89ab]/i.test(ip);
+  const [a, b] = ip.split('.').map(Number);
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+}
+async function assertPublicUrl(raw) {
+  if (!BLOCK_PRIVATE || /^magnet:/i.test(raw)) return;
+  const host = new URL(raw).hostname.replace(/^\[|\]$/g, '');
+  const addrs = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
+  if (addrs.some((a) => isPrivateIp(a.address))) throw new Error('That address is not allowed.');
+}
+
 const app = express();
 app.disable('x-powered-by');
 
@@ -76,12 +103,16 @@ app.use(express.static(PUBLIC_DIR)); // the UI itself is public; everything unde
 app.get('/api/ping', (req, res) => res.json({ ok: true, local: isLocal(req), authed: authed(req) }));
 
 app.post('/api/login', async (req, res) => {
-  const now = Date.now();
-  failedLogins = failedLogins.filter((t) => now - t < 600000);
-  if (failedLogins.length >= 10) return res.status(429).json({ error: 'Too many wrong PINs. Try again in 10 minutes.' });
+  const now = Date.now(), ip = clientIp(req);
+  const mine = recent(failedByIp.get(ip) || [], now); failedAll = recent(failedAll, now);
+  if (mine.length >= 10 || failedAll.length >= 100) return res.status(429).json({ error: 'Too many wrong PINs. Try again in 10 minutes.' });
   const given = String(req.body?.pin || '').trim().toUpperCase().replace(/[\s-]/g, '');
   const a = Buffer.from(sha(given)), b = Buffer.from(sha(config.pin));
-  if (!crypto.timingSafeEqual(a, b)) { failedLogins.push(now); return res.status(401).json({ error: 'Wrong PIN.' }); }
+  if (!crypto.timingSafeEqual(a, b)) {
+    failedByIp.set(ip, [...mine, now]); failedAll.push(now);
+    if (failedByIp.size > 5000) failedByIp.clear(); // bound memory
+    return res.status(401).json({ error: 'Wrong PIN.' });
+  }
   const token = crypto.randomBytes(32).toString('hex');
   config.tokens = [...config.tokens, sha(token)].slice(-20);
   await saveConfig();
@@ -142,6 +173,9 @@ function runMedia(job, format) {
     '-o', path.join(DOWNLOADS, '%(title).150B [%(id)s].%(ext)s'),
     '--progress-template', 'download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s',
     '--print', 'after_move:FILE|%(filepath)s'];
+  if (process.env.DL_JS_RUNTIME) args.push('--js-runtimes', process.env.DL_JS_RUNTIME); // YouTube needs a JS runtime (node in Docker)
+  const cookies = process.env.DL_COOKIES || path.join(DATA_DIR, 'cookies.txt'); // optional: export from a logged-in browser if a site blocks the server
+  if (existsSync(cookies)) args.push('--cookies', cookies);
   if (format === 'mp3') args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
   else if (format === 'm4a') args.push('-x', '--audio-format', 'm4a');
   else args.push('-f', 'bv*+ba/b', '--merge-output-format', 'mp4');
@@ -230,11 +264,12 @@ async function runTorrent(job) {
 }
 
 // ---------- API ----------
-app.post('/api/download', (req, res) => {
+app.post('/api/download', async (req, res) => {
   const url = String(req.body?.url || '').trim();
   const format = ['mp4', 'mp3', 'm4a'].includes(req.body?.format) ? req.body.format : 'mp4';
   const kind = detectKind(url);
   if (!kind) return res.status(400).json({ error: 'Enter an http(s) link, a magnet link or a .torrent URL.' });
+  try { await assertPublicUrl(url); } catch (e) { return res.status(400).json({ error: e.code === 'ENOTFOUND' ? 'Cannot resolve that address.' : e.message }); }
   const job = { id: randomUUID(), url, kind, status: 'queued', progress: 0, speed: '', eta: '', name: url, file: '', error: '' };
   jobs.set(job.id, job);
   emit(job);
@@ -343,5 +378,21 @@ await new Promise((resolve, reject) => {
   srv.once('error', reject);
 });
 console.log(`Downloader running at http://127.0.0.1:${boundPort}${HOST === '0.0.0.0' ? ' (also on your LAN)' : ''}`);
-console.log(`Remote PIN: ${config.pin}`);
+console.log(PIN_FROM_ENV ? 'Remote PIN: set via DL_PIN' : `Remote PIN: ${config.pin}`); // never log a PIN that came from the environment
+
+// keep SSE connections alive through proxies (they drop idle connections after ~60s)
+setInterval(() => { for (const res of clients) res.write(': ping\n\n'); }, 25000).unref();
+
+// optional auto-cleanup so a server disk doesn't fill up: DL_RETENTION_DAYS=7 deletes files older than 7 days
+const RETENTION_MS = Number(process.env.DL_RETENTION_DAYS) * 86400000;
+if (RETENTION_MS > 0) {
+  const sweep = async (dir) => {
+    for (const e of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) await sweep(p);
+      else if (Date.now() - (await stat(p)).mtimeMs > RETENTION_MS) await unlink(p).catch(() => {});
+    }
+  };
+  setInterval(() => sweep(DOWNLOADS), 3600000).unref();
+}
 export { boundPort as port };

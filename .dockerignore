@@ -1,0 +1,10 @@
+node_modules
+dist
+bin
+downloads
+test-save
+config.json
+.git
+electron
+build
+*.md

@@ -39,3 +39,29 @@ Same Wi-Fi without a tunnel: start with `DL_HOST=0.0.0.0` (the page must then be
 ## Notes
 - Vercel cannot run yt-dlp, ffmpeg or torrents (short-lived functions, no disk), which is why it only hosts the UI.
 - The 160 MB .exe is too big for the repo; attach it to a GitHub Release.
+
+## Always-on server (works with your laptop off)
+The same app runs in Docker on any always-on host. It serves the **web app and the API** at its own address, so you can just open that address in any browser (and install it on a phone). The Vercel page can also point at it.
+
+**Railway (simplest):**
+1. railway.com > New Project > Deploy from GitHub repo > pick this repo (it detects the `Dockerfile`).
+2. Add a **Volume** mounted at `/data` (keeps files and sign-ins across restarts).
+3. Variables: `DL_PIN` = a long PIN of your own, at least 8 characters (this is your password, use 12 or more).
+4. Settings > Networking > **Generate Domain**. Open that `https://….up.railway.app` address, enter the PIN.
+
+Fly.io / Render / any VPS work the same way: build the `Dockerfile`, mount a volume at `/data`, set `DL_PIN`, expose port 3000 (or `$PORT`).
+
+Server settings (already defaulted in the Dockerfile):
+| Variable | Meaning |
+|---|---|
+| `DL_PIN` | **Required.** Login PIN, min 8 characters. |
+| `DL_RETENTION_DAYS` | Auto-delete downloaded files older than N days (default 7) so the disk doesn't fill. |
+| `DL_BLOCK_PRIVATE=1` | Refuse links that point at private/internal addresses (best-effort SSRF guard). |
+| `DL_COOKIES` / `/data/cookies.txt` | Optional cookies file for sites that block the server. |
+
+Things to know:
+- **YouTube often blocks datacenter IPs.** Video downloads from a server can fail with a "sign in / confirm you're not a bot" error. A cookies file or a residential proxy helps but is not guaranteed. Torrents and direct links are unaffected.
+- yt-dlp self-updates at every container start; redeploy/restart now and then if a site stops working.
+- Files live on the server's volume and you download them to your phone from the app. Mind disk size and bandwidth costs.
+- Keep the PIN long: the server is on the open internet. Wrong PINs lock out the guessing IP for 10 minutes.
+- Download only what you're allowed to. You are responsible for what you fetch through your own server.
