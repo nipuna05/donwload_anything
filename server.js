@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { createWriteStream, existsSync } from 'node:fs';
 import { mkdir, readdir, readFile, writeFile, stat, unlink, access, constants as fsc } from 'node:fs/promises';
 import os from 'node:os';
-import { randomUUID } from 'node:crypto';
+import crypto, { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
@@ -15,8 +15,10 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DL_DATA || root; // where config.json lives
 const BIN_DIR = process.env.DL_BIN || path.join(root, 'bin');
 const YTDLP = path.join(BIN_DIR, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
-const PORT = Number(process.env.PORT) || 3000;
-const HOST = '127.0.0.1'; // local only, never exposed to the network
+const PORT = process.env.PORT === undefined ? 3000 : Number(process.env.PORT);
+const HOST = process.env.DL_HOST || '127.0.0.1'; // set DL_HOST=0.0.0.0 to allow other devices on your Wi-Fi (PIN required)
+const PUBLIC_DIR = process.env.DL_PUBLIC || path.join(root, 'public');
+const FFMPEG = ffmpegPath.replace('app.asar' + path.sep, 'app.asar.unpacked' + path.sep); // packaged Electron app
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const DEFAULT_DOWNLOADS = process.env.DL_DOWNLOADS || path.join(root, 'downloads');
 
@@ -27,11 +29,67 @@ let DOWNLOADS = path.resolve(config.downloadDir || DEFAULT_DOWNLOADS);
 try { await mkdir(DOWNLOADS, { recursive: true }); }
 catch { DOWNLOADS = path.resolve(DEFAULT_DOWNLOADS); await mkdir(DOWNLOADS, { recursive: true }); }
 
-const isLoopback = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+const saveConfig = () => writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
 
+// ---------- access control ----------
+// "Local" = the person sitting at this PC (Electron window / localhost browser tab).
+// Tunnels (cloudflared, tailscale) also connect from loopback, so forwarding headers, a foreign Host
+// (DNS rebinding) or a foreign Origin (another website's page) all make a request NON-local.
+const FORWARD_HEADERS = ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto', 'forwarded', 'cf-connecting-ip', 'cf-ray', 'x-real-ip', 'tailscale-user-login'];
+function isLocal(req) {
+  if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress)) return false;
+  if (FORWARD_HEADERS.some((h) => req.headers[h])) return false;
+  const host = (req.headers.host || '').replace(/:\d+$/, '');
+  if (!['127.0.0.1', 'localhost', '[::1]'].includes(host)) return false;
+  const origin = req.headers.origin;
+  if (origin) { try { if (new URL(origin).host !== req.headers.host) return false; } catch { return false; } }
+  return true;
+}
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const newPin = () => { const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; return Array.from(crypto.randomBytes(8), (b) => a[b % a.length]).join(''); };
+const tokenOf = (req) => (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || String(req.query.token || '');
+const hasValidToken = (req) => { const t = tokenOf(req); return !!t && (config.tokens || []).includes(sha(t)); };
+const authed = (req) => isLocal(req) || hasValidToken(req);
+
+if (!config.pin) { config.pin = newPin(); await saveConfig(); }
+config.tokens ||= [];
+
+let failedLogins = []; // global lockout: 10 wrong PINs in 10 minutes blocks logins for the rest of that window
 const app = express();
+app.disable('x-powered-by');
+
+// CORS: the Vercel-hosted UI is a different origin. Safe because auth is a bearer token, never a cookie,
+// and a foreign Origin is never treated as local.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.set({ 'Access-Control-Allow-Origin': origin, Vary: 'Origin',
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS' });
+    if (req.headers['access-control-request-private-network']) res.set('Access-Control-Allow-Private-Network', 'true');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json({ limit: '100kb' }));
-app.use(express.static(path.join(root, 'public')));
+app.use(express.static(PUBLIC_DIR)); // the UI itself is public; everything under /api and /files is not
+
+app.get('/api/ping', (req, res) => res.json({ ok: true, local: isLocal(req), authed: authed(req) }));
+
+app.post('/api/login', async (req, res) => {
+  const now = Date.now();
+  failedLogins = failedLogins.filter((t) => now - t < 600000);
+  if (failedLogins.length >= 10) return res.status(429).json({ error: 'Too many wrong PINs. Try again in 10 minutes.' });
+  const given = String(req.body?.pin || '').trim().toUpperCase().replace(/[\s-]/g, '');
+  const a = Buffer.from(sha(given)), b = Buffer.from(sha(config.pin));
+  if (!crypto.timingSafeEqual(a, b)) { failedLogins.push(now); return res.status(401).json({ error: 'Wrong PIN.' }); }
+  const token = crypto.randomBytes(32).toString('hex');
+  config.tokens = [...config.tokens, sha(token)].slice(-20);
+  await saveConfig();
+  res.json({ token });
+});
+
+app.use(['/api', '/files'], (req, res, next) => (authed(req) ? next() : res.status(401).json({ error: 'Login required' })));
+
 // always serves from the *current* download folder
 app.use('/files', (req, res, next) => express.static(DOWNLOADS, { dotfiles: 'deny', index: false })(req, res, next));
 
@@ -80,7 +138,7 @@ function runMedia(job, format) {
   if (!existsSync(YTDLP)) {
     return update(job, { status: 'error', error: 'yt-dlp missing. Run: npm run setup' });
   }
-  const args = ['--newline', '--no-playlist', '--ffmpeg-location', ffmpegPath,
+  const args = ['--newline', '--no-playlist', '--ffmpeg-location', FFMPEG,
     '-o', path.join(DOWNLOADS, '%(title).150B [%(id)s].%(ext)s'),
     '--progress-template', 'download:PROG|%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s',
     '--print', 'after_move:FILE|%(filepath)s'];
@@ -198,10 +256,22 @@ app.post('/api/cancel/:id', (req, res) => {
 });
 
 // ---------- settings API (loopback only: a remote device must not choose folders on the PC) ----------
-app.get('/api/settings', (_req, res) => res.json({ downloadDir: DOWNLOADS }));
+app.get('/api/settings', (req, res) => res.json(isLocal(req) ? { downloadDir: DOWNLOADS, canChange: true } : { downloadDir: null, canChange: false }));
+
+// remote-access info for the PC's own screen: PIN + addresses phones can use
+app.get('/api/remote-info', (req, res) => {
+  if (!isLocal(req)) return res.sendStatus(403);
+  const lan = Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => `http://${i.address}:${boundPort}`);
+  res.json({ pin: config.pin, port: boundPort, lanUrls: HOST === '0.0.0.0' ? lan : [], lanEnabled: HOST === '0.0.0.0' });
+});
+app.post('/api/pin/regenerate', async (req, res) => { // also signs out every connected device
+  if (!isLocal(req)) return res.sendStatus(403);
+  config.pin = newPin(); config.tokens = []; await saveConfig();
+  res.json({ pin: config.pin });
+});
 
 app.post('/api/settings', async (req, res) => {
-  if (!isLoopback(req)) return res.status(403).json({ error: 'Settings can only be changed on the PC itself.' });
+  if (!isLocal(req)) return res.status(403).json({ error: 'Settings can only be changed on the PC itself.' });
   const dir = String(req.body?.downloadDir || '').trim();
   if (!dir || !path.isAbsolute(dir)) return res.status(400).json({ error: 'Enter a full folder path, e.g. D:\\Downloads' });
   try {
@@ -216,7 +286,7 @@ app.post('/api/settings', async (req, res) => {
 
 // folder browser for the "Browse" button (loopback only)
 app.get('/api/browse', async (req, res) => {
-  if (!isLoopback(req)) return res.sendStatus(403);
+  if (!isLocal(req)) return res.sendStatus(403);
   const p = String(req.query.path || '');
   try {
     if (!p) { // top level: drives on Windows, home on others
@@ -267,4 +337,11 @@ app.get('/api/events', (req, res) => {
 // clean JSON errors instead of HTML stack traces
 app.use((err, _req, res, _next) => res.status(err.status || 500).json({ error: err.type === 'entity.parse.failed' ? 'Invalid JSON' : 'Server error' }));
 
-app.listen(PORT, HOST, () => console.log(`Downloader running at http://${HOST}:${PORT}`));
+let boundPort = PORT;
+await new Promise((resolve, reject) => {
+  const srv = app.listen(PORT, HOST, () => { boundPort = srv.address().port; resolve(); });
+  srv.once('error', reject);
+});
+console.log(`Downloader running at http://127.0.0.1:${boundPort}${HOST === '0.0.0.0' ? ' (also on your LAN)' : ''}`);
+console.log(`Remote PIN: ${config.pin}`);
+export { boundPort as port };

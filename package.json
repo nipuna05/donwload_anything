@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "setup": "node scripts/setup.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "electron": "electron .",
+    "icons": "node scripts/make-icons.js",
+    "dist": "electron-builder --win portable"
   },
   "engines": {
     "node": ">=20"
@@ -14,5 +17,55 @@
     "express": "^5.3.0",
     "ffmpeg-static": "^5.3.0",
     "webtorrent": "^3.0.21"
+  },
+  "devDependencies": {
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0"
+  },
+  "main": "electron/main.js",
+  "description": "Download videos, audio, torrents and files by URL",
+  "author": "Nipuna",
+  "build": {
+    "appId": "com.local.urldownloader",
+    "productName": "URL Downloader",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "electron/**",
+      "server.js",
+      "public/**",
+      "build/icon.png",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin",
+        "filter": [
+          "yt-dlp.exe"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "URL-Downloader-portable-${version}.exe"
+    },
+    "npmRebuild": false
   }
 }
