@@ -40,9 +40,21 @@ const jobs = new Map();
 const clients = new Set(); // SSE listeners
 const torrentClient = new WebTorrent();
 
+// torrent file list: live while the torrent is active, last snapshot afterwards
+function torrentFiles(j) {
+  const t = j.torrent;
+  if (t && !t.destroyed && t.files?.length) {
+    j.filesSnap = t.files.slice(0, 500).map((f) => ({
+      path: f.path.split(path.sep).join('/'), name: f.name, size: f.length, progress: Math.min(1, Math.max(0, f.progress || 0)),
+    }));
+    j.filesTotal = t.files.length;
+  }
+  return j.filesSnap;
+}
 const publicJob = (j) => ({
   id: j.id, url: j.url, kind: j.kind, status: j.status, progress: j.progress,
   speed: j.speed, eta: j.eta, name: j.name, file: j.file, error: j.error,
+  files: j.kind === 'torrent' ? torrentFiles(j) : undefined, filesTotal: j.filesTotal,
 });
 function emit(job) {
   const data = `data: ${JSON.stringify(publicJob(job))}\n\n`;
@@ -145,7 +157,7 @@ async function runTorrent(job) {
     update(job, { status: 'fetching metadata' });
     const t = torrentClient.add(source, { path: DOWNLOADS });
     job.torrent = t;
-    t.on('ready', () => { job.name = t.name; job.file = t.name; emit(job); });
+    t.on('ready', () => { job.name = t.name; job.file = t.name; update(job, { status: 'downloading' }); }); // metadata fetched -> file list is now available
     t.on('download', () => {
       if (Date.now() - (job._last || 0) < 500) return;
       job._last = Date.now();

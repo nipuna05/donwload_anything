@@ -27,6 +27,10 @@
   .done .bar > i { background:var(--ok); } .error .meta { color:var(--err); }
   a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
   .empty { color:var(--muted); }
+  details { margin-top:8px; } summary { cursor:pointer; font-size:13px; color:var(--accent); }
+  .flist { max-height:220px; overflow:auto; margin-top:6px; border:1px solid var(--line); border-radius:8px; }
+  .frow { display:flex; gap:10px; align-items:center; padding:6px 10px; border-top:1px solid var(--line); font-size:13px; } .frow:first-child { border-top:0; }
+  .fname { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   dialog { border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--text); width:min(520px,92vw); padding:16px; }
   dialog::backdrop { background:rgba(0,0,0,.45); }
   .dirrow { padding:8px 12px; cursor:pointer; border-top:1px solid var(--line); } .dirrow:first-child { border-top:0; } .dirrow:hover { background:var(--bg); }
@@ -78,7 +82,24 @@ const jobs = new Map();
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 const size = (b) => b > 1073741824 ? (b/1073741824).toFixed(2)+' GB' : b > 1048576 ? (b/1048576).toFixed(1)+' MB' : Math.max(1,Math.round(b/1024))+' KB';
 
+const openJobs = new Set(), scrolls = new Map();
+const fileUrl = (p) => '/files/' + p.split('/').map(encodeURIComponent).join('/');
+function filesHtml(j) {
+  if (!j.files || !j.files.length) return '';
+  const done = j.files.filter((f) => f.progress >= 1).length;
+  const total = j.filesTotal || j.files.length;
+  const sum = j.files.reduce((a, f) => a + f.size, 0);
+  return `<details data-job="${j.id}" ${openJobs.has(j.id) ? 'open' : ''}>
+    <summary>📂 ${esc(j.name)} — ${total} file${total > 1 ? 's' : ''}, ${size(sum)} (${done} complete)</summary>
+    <div class="flist" data-job="${j.id}">${j.files.map((f) => `
+      <div class="frow"><span class="fname" title="${esc(f.path)}">${esc(f.path)}</span>
+        <span class="meta">${size(f.size)} · ${Math.floor(f.progress * 100)}%</span>
+        ${f.progress >= 1 ? `<a href="${fileUrl(f.path)}" download>Save</a>` : ''}</div>`).join('')}
+      ${total > j.files.length ? `<div class="meta">…and ${total - j.files.length} more</div>` : ''}
+    </div></details>`;
+}
 function renderJobs() {
+  document.querySelectorAll('.flist').forEach((el) => scrolls.set(el.dataset.job, el.scrollTop));
   const list = [...jobs.values()].reverse();
   $('jobs').className = list.length ? '' : 'empty';
   $('jobs').innerHTML = list.length ? list.map((j) => `
@@ -86,10 +107,16 @@ function renderJobs() {
       <div class="top"><div class="name" title="${esc(j.url)}">${esc(j.name || j.url)}</div>
         ${['done','error','cancelled'].includes(j.status) ? '' : `<button class="small" data-cancel="${j.id}">Cancel</button>`}</div>
       <div class="meta">${esc(j.kind)} · ${esc(j.status)}${j.progress ? ' · ' + j.progress.toFixed(1) + '%' : ''}${j.speed ? ' · ' + esc(j.speed) : ''}${j.eta ? ' · ETA ' + esc(j.eta) : ''}${j.error ? ' · ' + esc(j.error) : ''}
-        ${j.status === 'done' && j.file ? ' · <a href="/files/' + encodeURI(j.file) + '" download>Save</a>' : ''}</div>
+        ${j.status === 'done' && j.file && j.kind !== 'torrent' ? ' · <a href="' + fileUrl(j.file) + '" download>Save</a>' : ''}</div>
       <div class="bar"><i style="width:${Math.min(100, j.progress || 0)}%"></i></div>
+      ${filesHtml(j)}
     </div>`).join('') : 'Nothing yet.';
+  document.querySelectorAll('.flist').forEach((el) => { el.scrollTop = scrolls.get(el.dataset.job) || 0; });
 }
+document.addEventListener('toggle', (e) => {
+  const id = e.target.dataset?.job;
+  if (id && e.target.tagName === 'DETAILS') e.target.open ? openJobs.add(id) : openJobs.delete(id);
+}, true);
 
 async function loadFiles() {
   const files = await (await fetch('/api/files')).json();
