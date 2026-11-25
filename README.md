@@ -36,6 +36,9 @@ Security model: everything under `/api` and `/files` needs the PIN-issued token 
 
 Same Wi-Fi without a tunnel: start with `DL_HOST=0.0.0.0` (the page must then be opened over http from the PC's address, not from Vercel).
 
+### Same page on GitHub Pages (no Vercel needed)
+The page is also published at https://nipuna05.github.io/donwload_anything/ (branch `gh-pages`). It behaves exactly like the Vercel one: it is only the screen and needs an engine (your PC + tunnel, or the cloud server) behind it. After changing anything in `public/`, commit and run `npm run pages` to republish.
+
 ## Notes
 - Vercel cannot run yt-dlp, ffmpeg or torrents (short-lived functions, no disk), which is why it only hosts the UI.
 - The 160 MB .exe is too big for the repo; attach it to a GitHub Release.

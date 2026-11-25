@@ -8,7 +8,8 @@
     "start": "node server.js",
     "electron": "electron .",
     "icons": "node scripts/make-icons.js",
-    "dist": "electron-builder --win portable"
+    "dist": "electron-builder --win portable",
+    "pages": "node scripts/publish-pages.js"
   },
   "engines": {
     "node": ">=20"
