@@ -79,7 +79,7 @@ async function assertPublicUrl(raw) {
   if (!BLOCK_PRIVATE || /^magnet:/i.test(raw)) return;
   const host = new URL(raw).hostname.replace(/^\[|\]$/g, '');
   const addrs = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
-  if (addrs.some((a) => isPrivateIp(a.address))) throw new Error('That address is not allowed.');
+  if (addrs.some((a) => isPrivateIp(a.address))) throw new Error('Links to private or internal network addresses are blocked on this server.');
 }
 
 const app = express();
@@ -153,6 +153,74 @@ function update(job, patch) { Object.assign(job, patch); emit(job); }
 
 const safeName = (s) => String(s).replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 150) || 'download';
 const fmtSpeed = (b) => (b > 1048576 ? (b / 1048576).toFixed(1) + ' MB/s' : (b / 1024).toFixed(0) + ' KB/s');
+
+// ---------- plain-language errors ----------
+// Checks what the user typed before anything starts, and says exactly what is wrong.
+function checkInput(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return { error: 'Paste a link first.' };
+  if (/^magnet:/i.test(s)) {
+    return /xt=urn:btih:([0-9a-f]{40}|[a-z2-7]{32})(&|$)/i.test(s) ? { url: s }
+      : { error: 'This magnet link is not valid: it has no info-hash (xt=urn:btih:...). Copy the whole link again.' };
+  }
+  if (/\s/.test(s)) return { error: 'That looks like text, not a link. Paste one link with no spaces.' };
+  if (/^[0-9a-f]{40}$/i.test(s) || /^[A-Z2-7]{32}$/i.test(s)) return { url: s }; // info-hash
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
+  if (!scheme) {
+    if (/^[\w-]+(\.[\w-]+)+(\/|$|\?|#)/.test(s)) s = 'https://' + s; // "youtube.com/watch?v=..." -> add https://
+    else return { error: "That doesn't look like a link. Links start with https:// or magnet:" };
+  } else if (!/^https?$/i.test(scheme[1])) {
+    return { error: `"${scheme[1]}://" links are not supported. Use an http(s) link, a magnet link, a .torrent URL or an info-hash.` };
+  }
+  try {
+    const u = new URL(s);
+    if (!u.hostname.includes('.') && u.hostname !== 'localhost' && !net.isIP(u.hostname.replace(/^\[|\]$/g, ''))) {
+      return { error: 'That web address looks incomplete (it has no domain such as .com).' };
+    }
+  } catch { return { error: 'That is not a valid web address. Check it for typos.' }; }
+  return { url: s };
+}
+const httpError = (s) => ({
+  401: 'The site needs a login for this file (401).', 403: 'The site refused access to this file (403).',
+  404: 'File not found (404). Check the link.', 410: 'This file has been removed (410).',
+  429: 'The site is limiting requests (429). Wait a while and try again.',
+}[s] || (s >= 500 ? `The website has a server problem (${s}). Try again later.` : `The website answered with an error (${s}).`));
+function netError(e) {
+  const c = e?.cause?.code || e?.cause?.errors?.[0]?.code || e?.code || '', m = String(e?.message || e);
+  if (c === 'ENOTFOUND' || c === 'EAI_AGAIN') return 'Cannot find that website. Check the spelling of the address and your internet connection.';
+  if (c === 'ECONNREFUSED') return 'The website refused the connection.';
+  if (/TIMEOUT|ETIMEDOUT/.test(c) || e?.name === 'TimeoutError') return 'The connection timed out. The site may be down or too slow.';
+  if (c === 'ECONNRESET' || /terminated|other side closed/i.test(m)) return 'The connection was interrupted. Try again.';
+  if (/CERT|SSL|TLS/i.test(c + m)) return 'There is a security certificate problem with that website.';
+  if (m === 'fetch failed') return 'Could not connect to that website. Check the address and your internet connection.';
+  if (c === 'ENOSPC') return 'There is not enough free disk space to save this file.';
+  if (c === 'EACCES' || c === 'EPERM') return 'No permission to write to the save folder. Choose another folder.';
+  return m;
+}
+function ytError(buf, code) {
+  const lines = buf.split('\n').map((l) => l.trim()).filter(Boolean);
+  const line = [...lines].reverse().find((l) => /^ERROR:/i.test(l)) || lines.pop() || `yt-dlp stopped (code ${code})`;
+  const rules = [
+    [/Unsupported URL/i, 'No downloadable video or audio found on that page. For torrents use a magnet link, a .torrent file URL or the info-hash.'],
+    [/Private video/i, 'This video is private.'],
+    [/age-restricted|confirm your age|age verification/i, 'This video is age-restricted and needs a signed-in account.'],
+    [/Sign in to confirm|not a bot|cookies/i, 'The site is asking for a sign-in / "not a bot" check and blocked this download. Try again later or from another network.'],
+    [/not available in your country|geo.?restrict|blocked it in your country/i, "This video isn't available in your country."],
+    [/copyright/i, 'This video is blocked for copyright reasons.'],
+    [/Video unavailable|video is unavailable|has been removed|no longer available|does not exist|been terminated|deleted/i, 'This video is unavailable or has been removed.'],
+    [/live event will begin|Premieres in|is a live|This live/i, "This is a live stream or premiere that hasn't started or can't be saved yet."],
+    [/HTTP Error 404/i, 'Page not found (404). Check the link.'],
+    [/HTTP Error 403/i, 'The site refused access (403).'],
+    [/HTTP Error 429|Too Many Requests/i, 'The site is limiting requests (429). Wait a while and try again.'],
+    [/HTTP Error 5\d\d/i, 'The website has a server problem. Try again later.'],
+    [/getaddrinfo|Name or service not known|Temporary failure in name resolution|Unable to download webpage|timed out|Connection (refused|reset)|No address associated/i, 'Cannot reach that website. Check the link and your internet connection.'],
+    [/ffmpeg|ffprobe/i, 'The audio/video converter (ffmpeg) is missing or failed, so the file could not be converted.'],
+    [/No space left|Errno 28/i, 'There is not enough free disk space to save this file.'],
+    [/Permission denied|Errno 13/i, 'No permission to write to the save folder. Choose another folder.'],
+  ];
+  for (const [re, msg] of rules) if (re.test(line)) return msg;
+  return 'Could not download: ' + line.replace(/^ERROR:\s*(\[[^\]]+\]\s*[\w-]*:\s*)?/i, '').slice(0, 200);
+}
 
 // Torrent-cache links (torrage.info/torrent.php?h=<hash>, itorrents.org/torrent/<HASH>.torrent) and bare info-hashes
 // are turned into magnet links, which the torrent engine finds via DHT + public trackers.
@@ -232,15 +300,11 @@ function runMedia(job, format) {
   let buf = '';
   p.stdout.on('data', (d) => { buf += d; const lines = buf.split(/\r?\n/); buf = lines.pop(); lines.forEach(onLine); });
   p.stderr.on('data', (d) => { errBuf += d; });
-  p.on('error', (e) => update(job, { status: 'error', error: e.message }));
+  p.on('error', (e) => update(job, { status: 'error', error: e.code === 'ENOENT' ? 'The video downloader (yt-dlp) was not found. Run "npm run setup" (or reinstall the app).' : e.message }));
   p.on('close', (code) => {
     if (job.status === 'cancelled') return;
     if (code === 0) update(job, { status: 'done', progress: 100, speed: '', eta: '' });
-    else {
-      let msg = errBuf.trim().split('\n').pop() || `yt-dlp exited ${code}`;
-      if (/Unsupported URL/i.test(msg)) msg = 'No downloadable video or audio found on that page. For torrents use a magnet link, a .torrent file URL or the info-hash.';
-      update(job, { status: 'error', error: msg });
-    }
+    else update(job, { status: 'error', error: ytError(errBuf, code) });
   });
 }
 
@@ -250,7 +314,11 @@ async function runDirect(job) {
   job.abort = () => ac.abort();
   try {
     const res = await fetch(job.url, { signal: ac.signal, redirect: 'follow' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) throw new Error(httpError(res.status));
+    if (/text\/html/i.test(res.headers.get('content-type') || '')) {
+      await res.body?.cancel();
+      throw new Error('That link returned a web page, not a file. Open it in your browser and copy the real download link.');
+    }
     let name = path.basename(new URL(res.url).pathname) || 'download';
     const cd = res.headers.get('content-disposition');
     const m = cd && /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
@@ -273,23 +341,32 @@ async function runDirect(job) {
     await pipeline(body, createWriteStream(dest), { signal: ac.signal });
     update(job, { status: 'done', progress: 100, speed: '' });
   } catch (e) {
-    if (job.status !== 'cancelled') update(job, { status: 'error', error: e.message });
+    if (job.status !== 'cancelled') update(job, { status: 'error', error: netError(e) });
   }
 }
 
 // ---------- torrent / magnet ----------
+const META_TIMEOUT = Number(process.env.DL_META_TIMEOUT_MS) || 90000;
 async function runTorrent(job) {
   try {
     let source = job.url;
     if (/^https?:/i.test(source)) { // .torrent URL -> fetch bytes
-      const res = await fetch(source);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const res = await fetch(source, { signal: AbortSignal.timeout(20000), headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!res.ok) throw new Error(httpError(res.status));
       source = Buffer.from(await res.arrayBuffer());
+      if (!/^d\d+:/.test(source.toString('latin1', 0, 16))) throw new Error('That link is not a .torrent file (it returned something else). Use a magnet link or the info-hash instead.');
     }
     update(job, { status: 'fetching metadata' });
     const t = torrentClient.add(source, { path: DOWNLOADS });
     job.torrent = t;
-    t.on('ready', () => { job.name = t.name; job.file = t.name; update(job, { status: 'downloading' }); }); // metadata fetched -> file list is now available
+    // a dead torrent / wrong hash never finds peers: say so instead of waiting forever
+    job._metaTimer = setTimeout(() => {
+      if (job.status === 'fetching metadata') {
+        t.destroy();
+        update(job, { status: 'error', error: `Couldn't get this torrent's file list within ${Math.round(META_TIMEOUT / 1000)} seconds (no peers found). The torrent may be dead, or the link/hash may be wrong.` });
+      }
+    }, META_TIMEOUT);
+    t.on('ready', () => { clearTimeout(job._metaTimer); job.name = t.name; job.file = t.name; update(job, { status: 'downloading' }); }); // metadata fetched -> file list is now available
     t.on('download', () => {
       if (Date.now() - (job._last || 0) < 500) return;
       job._last = Date.now();
@@ -297,20 +374,31 @@ async function runTorrent(job) {
         eta: t.timeRemaining ? Math.round(t.timeRemaining / 1000) + 's' : '' });
     });
     t.on('done', () => update(job, { status: 'done', progress: 100, speed: '', eta: '' }));
-    t.on('error', (e) => update(job, { status: 'error', error: /duplicate/i.test(String(e.message || e)) ? 'This torrent is already in the list (finished or still downloading).' : String(e.message || e) }));
+    t.on('error', (e) => { clearTimeout(job._metaTimer); update(job, { status: 'error', error: torrentError(e) }); });
   } catch (e) {
-    update(job, { status: 'error', error: /duplicate/i.test(e.message) ? 'This torrent is already in the list (finished or still downloading).' : e.message });
+    clearTimeout(job._metaTimer);
+    update(job, { status: 'error', error: torrentError(e) });
   }
 }
+function torrentError(e) {
+  const m = String(e?.message || e);
+  if (/duplicate/i.test(m)) return 'This torrent is already in the list (finished or still downloading).';
+  if (/Invalid torrent identifier|invalid.*(torrent|magnet)|bencode/i.test(m)) return "That isn't a valid magnet link, info-hash or .torrent file.";
+  return netError(e);
+}
+torrentClient.on('error', (e) => console.error('torrent client:', e.message)); // never crash the app on a torrent error
 
 // ---------- API ----------
 app.post('/api/download', async (req, res) => {
-  let url = String(req.body?.url || '').trim();
+  const checked = checkInput(req.body?.url);
+  if (checked.error) return res.status(400).json({ error: checked.error });
   const format = ['mp4', 'mp3', 'm4a'].includes(req.body?.format) ? req.body.format : 'mp4';
-  url = toMagnet(url) || url;
+  const url = toMagnet(checked.url) || checked.url;
   let kind = detectKind(url);
-  if (!kind) return res.status(400).json({ error: 'Enter an http(s) link, a magnet link, a .torrent URL or a torrent info-hash.' });
-  try { await assertPublicUrl(url); } catch (e) { return res.status(400).json({ error: e.code === 'ENOTFOUND' ? 'Cannot resolve that address.' : e.message }); }
+  if (!kind) return res.status(400).json({ error: "That doesn't look like a link. Links start with https:// or magnet:" });
+  try { await assertPublicUrl(url); } catch (e) {
+    return res.status(400).json({ error: e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN' ? 'Cannot find that website. Check the spelling of the address.' : e.message });
+  }
   if (kind === 'media') kind = await probeKind(url);
   const job = { id: randomUUID(), url, kind, status: 'queued', progress: 0, speed: '', eta: '', name: url, file: '', error: '' };
   jobs.set(job.id, job);
@@ -327,6 +415,7 @@ app.post('/api/cancel/:id', (req, res) => {
   if (['done', 'error', 'cancelled'].includes(job.status)) return res.json(publicJob(job));
   job.proc?.kill();
   job.abort?.();
+  clearTimeout(job._metaTimer);
   job.torrent?.destroy();
   update(job, { status: 'cancelled', speed: '', eta: '' });
   res.json(publicJob(job));
