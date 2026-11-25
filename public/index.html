@@ -271,6 +271,12 @@ function start() {
   $('disconnectRow').hidden = !(BASE || TOKEN);
   loadSettings(); loadRemote(); loadFiles();
   api('/api/jobs').then(json).then((l) => { (l || []).forEach((j) => jobs.set(j.id, j)); renderJobs(); });
+  // backup for live updates: tunnels/proxies sometimes stall the event stream, so also poll while anything is active
+  if (!window.pollTimer) window.pollTimer = setInterval(async () => {
+    if (!started || ![...jobs.values()].some((j) => !['done', 'error', 'cancelled'].includes(j.status))) return;
+    const r = await api('/api/jobs').catch(() => null); if (!r || !r.ok) return;
+    (await r.json()).forEach((j) => jobs.set(j.id, j)); renderJobs();
+  }, 3000);
   if (es) es.close();
   es = new EventSource(withToken('/api/events'));
   es.onmessage = (m) => {

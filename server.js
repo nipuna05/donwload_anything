@@ -154,6 +154,42 @@ function update(job, patch) { Object.assign(job, patch); emit(job); }
 const safeName = (s) => String(s).replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 150) || 'download';
 const fmtSpeed = (b) => (b > 1048576 ? (b / 1048576).toFixed(1) + ' MB/s' : (b / 1024).toFixed(0) + ' KB/s');
 
+// Torrent-cache links (torrage.info/torrent.php?h=<hash>, itorrents.org/torrent/<HASH>.torrent) and bare info-hashes
+// are turned into magnet links, which the torrent engine finds via DHT + public trackers.
+const PUBLIC_TRACKERS = ['udp://tracker.opentrackr.org:1337/announce', 'udp://open.tracker.cl:1337/announce',
+  'udp://tracker.torrent.eu.org:451/announce', 'wss://tracker.webtorrent.dev'];
+const CACHE_HOSTS = /(torrage|itorrents|torcache|btcache|thetorrent)/i;
+function toMagnet(input) {
+  let hash = null;
+  if (/^[0-9a-f]{40}$/i.test(input) || /^[A-Z2-7]{32}$/i.test(input)) hash = input;
+  else {
+    try {
+      const u = new URL(input);
+      const q = u.searchParams.get('hash') || u.searchParams.get('infohash') || u.searchParams.get('btih') || (CACHE_HOSTS.test(u.hostname) ? u.searchParams.get('h') : null);
+      if (q && /^[0-9a-f]{40}$/i.test(q)) hash = q;
+      else if (CACHE_HOSTS.test(u.hostname)) hash = /(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])/i.exec(u.pathname)?.[0] || null;
+    } catch { /* not a URL */ }
+  }
+  return hash ? `magnet:?xt=urn:btih:${hash}` + PUBLIC_TRACKERS.map((t) => '&tr=' + encodeURIComponent(t)).join('') : null;
+}
+
+// Pages that don't look like files by name: peek at what the server really returns.
+async function probeKind(url) {
+  const ac = new AbortController(); const timer = setTimeout(() => ac.abort(), 8000);
+  try {
+    const res = await fetch(url, { signal: ac.signal, redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0', Range: 'bytes=0-1023' } });
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    const cd = res.headers.get('content-disposition') || '';
+    let first = Buffer.alloc(0);
+    if (res.body && ct.includes('octet-stream')) { const r = res.body.getReader(); const { value } = await r.read(); first = Buffer.from(value || []); await r.cancel(); }
+    else await res.body?.cancel();
+    if (/bittorrent/.test(ct) || /\.torrent/i.test(cd)) return 'torrent';
+    if (first.length && /^d\d+:/.test(first.toString('latin1', 0, 16)) && /announce|4:info/.test(first.toString('latin1'))) return 'torrent'; // bencoded dictionary
+    if (/^(application\/(octet-stream|zip|pdf|x-.*zip.*|x-7z.*|x-rar.*)|image\/|video\/|audio\/)/.test(ct)) return 'direct';
+    return 'media'; // html pages etc. -> yt-dlp
+  } catch { return 'media'; } finally { clearTimeout(timer); }
+}
+
 function detectKind(input) {
   if (/^magnet:\?/i.test(input)) return 'torrent';
   let u;
@@ -200,7 +236,11 @@ function runMedia(job, format) {
   p.on('close', (code) => {
     if (job.status === 'cancelled') return;
     if (code === 0) update(job, { status: 'done', progress: 100, speed: '', eta: '' });
-    else update(job, { status: 'error', error: errBuf.trim().split('\n').pop() || `yt-dlp exited ${code}` });
+    else {
+      let msg = errBuf.trim().split('\n').pop() || `yt-dlp exited ${code}`;
+      if (/Unsupported URL/i.test(msg)) msg = 'No downloadable video or audio found on that page. For torrents use a magnet link, a .torrent file URL or the info-hash.';
+      update(job, { status: 'error', error: msg });
+    }
   });
 }
 
@@ -257,19 +297,21 @@ async function runTorrent(job) {
         eta: t.timeRemaining ? Math.round(t.timeRemaining / 1000) + 's' : '' });
     });
     t.on('done', () => update(job, { status: 'done', progress: 100, speed: '', eta: '' }));
-    t.on('error', (e) => update(job, { status: 'error', error: String(e.message || e) }));
+    t.on('error', (e) => update(job, { status: 'error', error: /duplicate/i.test(String(e.message || e)) ? 'This torrent is already in the list (finished or still downloading).' : String(e.message || e) }));
   } catch (e) {
-    update(job, { status: 'error', error: e.message });
+    update(job, { status: 'error', error: /duplicate/i.test(e.message) ? 'This torrent is already in the list (finished or still downloading).' : e.message });
   }
 }
 
 // ---------- API ----------
 app.post('/api/download', async (req, res) => {
-  const url = String(req.body?.url || '').trim();
+  let url = String(req.body?.url || '').trim();
   const format = ['mp4', 'mp3', 'm4a'].includes(req.body?.format) ? req.body.format : 'mp4';
-  const kind = detectKind(url);
-  if (!kind) return res.status(400).json({ error: 'Enter an http(s) link, a magnet link or a .torrent URL.' });
+  url = toMagnet(url) || url;
+  let kind = detectKind(url);
+  if (!kind) return res.status(400).json({ error: 'Enter an http(s) link, a magnet link, a .torrent URL or a torrent info-hash.' });
   try { await assertPublicUrl(url); } catch (e) { return res.status(400).json({ error: e.code === 'ENOTFOUND' ? 'Cannot resolve that address.' : e.message }); }
+  if (kind === 'media') kind = await probeKind(url);
   const job = { id: randomUUID(), url, kind, status: 'queued', progress: 0, speed: '', eta: '', name: url, file: '', error: '' };
   jobs.set(job.id, job);
   emit(job);
@@ -363,7 +405,7 @@ app.delete('/api/files', async (req, res) => {
 });
 
 app.get('/api/events', (req, res) => {
-  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.flushHeaders();
   clients.add(res);
   req.on('close', () => clients.delete(res));
