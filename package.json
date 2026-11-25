@@ -8,8 +8,9 @@
     "start": "node server.js",
     "electron": "electron .",
     "icons": "node scripts/make-icons.js",
-    "dist": "electron-builder --win portable",
-    "pages": "node scripts/publish-pages.js"
+    "dist": "electron-builder --win portable nsis",
+    "pages": "node scripts/publish-pages.js",
+    "dist:installer": "electron-builder --win nsis"
   },
   "engines": {
     "node": ">=20"
@@ -59,6 +60,12 @@
           "arch": [
             "x64"
           ]
+        },
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "icon": "build/icon.png",
@@ -67,6 +74,16 @@
     "portable": {
       "artifactName": "URL-Downloader-portable-${version}.exe"
     },
-    "npmRebuild": false
+    "npmRebuild": false,
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "URL Downloader",
+      "artifactName": "URL-Downloader-Setup-${version}.exe",
+      "deleteAppDataOnUninstall": false
+    }
   }
 }
