@@ -8,6 +8,7 @@ import os from 'node:os';
 import net from 'node:net';
 import dns from 'node:dns/promises';
 import crypto, { randomUUID } from 'node:crypto';
+import { convertFile, targetFor } from './converter.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
@@ -133,8 +134,9 @@ const torrentClient = new WebTorrent();
 function torrentFiles(j) {
   const t = j.torrent;
   if (t && !t.destroyed && t.files?.length) {
-    j.filesSnap = t.files.slice(0, 500).map((f) => ({
-      path: f.path.split(path.sep).join('/'), name: f.name, size: f.length, progress: Math.min(1, Math.max(0, f.progress || 0)),
+    j.filesSnap = t.files.slice(0, 500).map((f, i) => ({
+      i, path: f.path.split(path.sep).join('/'), name: f.name, size: f.length, progress: Math.min(1, Math.max(0, f.progress || 0)),
+      sel: !j.sel || j.sel.has(i), // false = the user skipped this file
     }));
     j.filesTotal = t.files.length;
   }
@@ -144,6 +146,7 @@ const publicJob = (j) => ({
   id: j.id, url: j.url, kind: j.kind, status: j.status, progress: j.progress,
   speed: j.speed, eta: j.eta, name: j.name, file: j.file, error: j.error,
   files: j.kind === 'torrent' ? torrentFiles(j) : undefined, filesTotal: j.filesTotal,
+  stage: j.stage, outputs: j.outputs, warn: j.warn, convert: j.convert,
 });
 function emit(job) {
   const data = `data: ${JSON.stringify(publicJob(job))}\n\n`;
@@ -357,7 +360,7 @@ async function runTorrent(job) {
       if (!/^d\d+:/.test(source.toString('latin1', 0, 16))) throw new Error('That link is not a .torrent file (it returned something else). Use a magnet link or the info-hash instead.');
     }
     update(job, { status: 'fetching metadata' });
-    const t = torrentClient.add(source, { path: DOWNLOADS });
+    const t = torrentClient.add(source, { path: DOWNLOADS, deselect: !!job.choose }); // deselect: wait for the user to pick files
     job.torrent = t;
     // a dead torrent / wrong hash never finds peers: say so instead of waiting forever
     job._metaTimer = setTimeout(() => {
@@ -366,15 +369,12 @@ async function runTorrent(job) {
         update(job, { status: 'error', error: `Couldn't get this torrent's file list within ${Math.round(META_TIMEOUT / 1000)} seconds (no peers found). The torrent may be dead, or the link/hash may be wrong.` });
       }
     }, META_TIMEOUT);
-    t.on('ready', () => { clearTimeout(job._metaTimer); job.name = t.name; job.file = t.name; update(job, { status: 'downloading' }); }); // metadata fetched -> file list is now available
-    t.on('download', () => {
-      if (Date.now() - (job._last || 0) < 500) return;
-      job._last = Date.now();
-      update(job, { status: 'downloading', progress: t.progress * 100, speed: fmtSpeed(t.downloadSpeed),
-        eta: t.timeRemaining ? Math.round(t.timeRemaining / 1000) + 's' : '' });
+    t.on('ready', () => { // metadata fetched -> the file list is now available
+      clearTimeout(job._metaTimer); job.name = t.name; job.file = t.name;
+      if (job.choose) update(job, { status: 'choose files' });            // user picks files + output, then POST /api/torrent/:id/start
+      else beginTorrent(job, t.files.map((_, i) => i), 'none', false);     // API clients: download everything
     });
-    t.on('done', () => update(job, { status: 'done', progress: 100, speed: '', eta: '' }));
-    t.on('error', (e) => { clearTimeout(job._metaTimer); update(job, { status: 'error', error: torrentError(e) }); });
+    t.on('error', (e) => { clearTimeout(job._metaTimer); clearInterval(job._monitor); update(job, { status: 'error', error: torrentError(e) }); });
   } catch (e) {
     clearTimeout(job._metaTimer);
     update(job, { status: 'error', error: torrentError(e) });
@@ -388,6 +388,69 @@ function torrentError(e) {
 }
 torrentClient.on('error', (e) => console.error('torrent client:', e.message)); // never crash the app on a torrent error
 
+// Start downloading the chosen files; convert afterwards if asked (convert: 'none' | 'mp4' | 'mp3').
+function beginTorrent(job, indices, convert, deleteOriginal) {
+  const t = job.torrent;
+  job.sel = new Set(indices); job.convert = convert; job.deleteOriginal = !!deleteOriginal;
+  // The torrent starts with nothing selected (job.choose), so only select the chosen files. Never call deselect():
+  // small files share pieces with their neighbours, and deselecting one would remove a chosen file's piece.
+  if (job.choose) t.files.forEach((f, i) => { if (job.sel.has(i)) f.select(); });
+  update(job, { status: 'downloading', progress: 0 });
+  job._monitor = setInterval(() => {
+    if (job.status !== 'downloading') return clearInterval(job._monitor);
+    let have = 0, total = 0;
+    for (const i of job.sel) { const f = t.files[i]; have += Math.min(f.downloaded, f.length); total += f.length; }
+    const speed = t.downloadSpeed;
+    update(job, { progress: total ? (have / total) * 100 : 100, speed: fmtSpeed(speed), eta: speed > 0 ? Math.round((total - have) / speed) + 's' : '' });
+    if (have >= total) { clearInterval(job._monitor); finishTorrent(job).catch((e) => update(job, { status: 'error', error: torrentError(e) })); }
+  }, 1000);
+}
+
+async function finishTorrent(job) {
+  update(job, { progress: 100, speed: '', eta: '' }); // refreshes the file snapshot while the torrent is still live
+  const t = job.torrent;
+  const selected = [...job.sel].map((i) => ({ i, rel: t.files[i].path.split(path.sep).join('/') }));
+  t.destroy(); // stop seeding; downloaded files stay on disk
+  // Skipped files leave empty, full-size placeholders behind. Remove only those created during THIS job:
+  // a file that already existed (an earlier download) must never be touched.
+  for (const f of job.filesSnap || []) {
+    if (f.sel || f.progress >= 1) continue;
+    const p = path.join(DOWNLOADS, f.path);
+    const st = await stat(p).catch(() => null);
+    if (st && st.birthtimeMs && st.birthtimeMs >= job.startedAt - 2000) await unlink(p).catch(() => {});
+  }
+  job.outputs = job.outputs || [];
+  if (job.convert === 'none') return update(job, { status: 'done' });
+
+  const todo = selected.map((s) => ({ ...s, out: targetFor(s.rel, job.convert) })).filter((s) => s.out);
+  if (!todo.length) return update(job, { status: 'done', warn: job.convert === 'mp4' ? 'No videos needed converting (everything was already MP4 or not a video).' : 'No audio or video files to convert to MP3.' });
+  const warnings = [];
+  job.convHolder = {};
+  for (let n = 0; n < todo.length; n++) {
+    if (job.status === 'cancelled') return;
+    const src = path.join(DOWNLOADS, todo[n].rel);
+    update(job, { status: 'converting', stage: `Converting ${n + 1} of ${todo.length}: ${path.basename(src)}`, progress: (n / todo.length) * 100 });
+    try {
+      const r = await convertFile(FFMPEG, src, job.convert, {
+        holder: job.convHolder,
+        onProgress: (p) => update(job, { progress: ((n + p) / todo.length) * 100 }),
+      });
+      if (job.status === 'cancelled') return;
+      if (r) {
+        const outRel = path.relative(DOWNLOADS, r.out).split(path.sep).join('/');
+        job.outputs.push({ path: outRel, name: r.name, size: (await stat(r.out)).size });
+        if (job.deleteOriginal) await unlink(src).catch(() => {});
+      }
+    } catch (e) {
+      if (job.status === 'cancelled') return;
+      warnings.push(`${path.basename(src)}: ${e.message}`);
+    }
+  }
+  if (job.status === 'cancelled') return;
+  if (!job.outputs.length) return update(job, { status: 'error', stage: '', error: 'The files were downloaded but could not be converted. ' + warnings[0] });
+  update(job, { status: 'done', stage: '', progress: 100, warn: warnings.length ? `${warnings.length} file(s) could not be converted: ${warnings.join(' · ')}` : '' });
+}
+
 // ---------- API ----------
 app.post('/api/download', async (req, res) => {
   const checked = checkInput(req.body?.url);
@@ -400,7 +463,7 @@ app.post('/api/download', async (req, res) => {
     return res.status(400).json({ error: e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN' ? 'Cannot find that website. Check the spelling of the address.' : e.message });
   }
   if (kind === 'media') kind = await probeKind(url);
-  const job = { id: randomUUID(), url, kind, status: 'queued', progress: 0, speed: '', eta: '', name: url, file: '', error: '' };
+  const job = { id: randomUUID(), url, kind, status: 'queued', progress: 0, speed: '', eta: '', name: url, file: '', error: '', choose: kind === 'torrent' && req.body?.choose === true, startedAt: Date.now() };
   jobs.set(job.id, job);
   emit(job);
   if (kind === 'media') runMedia(job, format);
@@ -415,9 +478,24 @@ app.post('/api/cancel/:id', (req, res) => {
   if (['done', 'error', 'cancelled'].includes(job.status)) return res.json(publicJob(job));
   job.proc?.kill();
   job.abort?.();
-  clearTimeout(job._metaTimer);
+  clearTimeout(job._metaTimer); clearInterval(job._monitor);
   job.torrent?.destroy();
-  update(job, { status: 'cancelled', speed: '', eta: '' });
+  update(job, { status: 'cancelled', speed: '', eta: '', stage: '' });
+  if (job.convHolder) { job.convHolder.killed = true; job.convHolder.proc?.kill(); } // stop a running conversion
+  res.json(publicJob(job));
+});
+
+// After the file list is shown: the user picks files and what to do with them.
+app.post('/api/torrent/:id/start', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || job.kind !== 'torrent') return res.status(404).json({ error: 'That torrent is no longer in the list.' });
+  if (job.status !== 'choose files') return res.status(409).json({ error: 'This torrent has already been started.' });
+  const n = job.torrent?.files?.length || 0;
+  const files = req.body?.files === 'all' ? [...Array(n).keys()] : (Array.isArray(req.body?.files) ? req.body.files : []);
+  const idx = [...new Set(files.filter((i) => Number.isInteger(i) && i >= 0 && i < n))];
+  if (!idx.length) return res.status(400).json({ error: 'Select at least one file to download.' });
+  const convert = ['none', 'mp4', 'mp3'].includes(req.body?.convert) ? req.body.convert : 'none';
+  beginTorrent(job, idx, convert, req.body?.deleteOriginal === true);
   res.json(publicJob(job));
 });
 

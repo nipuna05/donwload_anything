@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev          # also fetches the ffmpeg binary (ffmpeg-static)
-COPY server.js ./
+COPY server.js converter.js ./
 COPY public ./public
 COPY scripts ./scripts
 RUN node scripts/setup.js && chmod +x bin/yt-dlp   # downloads the Linux yt-dlp into ./bin

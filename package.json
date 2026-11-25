@@ -39,7 +39,8 @@
       "server.js",
       "public/**",
       "build/icon.png",
-      "package.json"
+      "package.json",
+      "converter.js"
     ],
     "asarUnpack": [
       "node_modules/ffmpeg-static/**"

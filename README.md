@@ -6,6 +6,7 @@ Paste a link, get the file. Runs on your PC; your phone can use it as a remote.
 - **Magnet links and .torrent URLs** -> WebTorrent, with a live file list
 - **Direct file links** -> streamed download
 - Choose the save folder in the app (Browse button).
+- **Torrents:** once the file list arrives you can tick the files you want (or press *Download all*), and choose what happens afterwards: keep the files, convert videos to **MP4**, or extract the audio as **MP3** (ffmpeg; fast copy when the video is already MP4-compatible, otherwise re-encoded). Originals can be deleted after converting.
 
 Only download content you own or are licensed to download.
 
