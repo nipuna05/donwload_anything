@@ -31,7 +31,10 @@
   .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500; }
   .meta { color:var(--muted); font-size:13px; margin-top:2px; }
   .bar { height:6px; background:var(--line); border-radius:3px; margin-top:6px; overflow:hidden; } .bar > i { display:block; height:100%; background:var(--accent); transition:width .3s; }
-  .done .bar > i { background:var(--ok); } .error .meta { color:var(--err); }
+  .done .bar > i { background:var(--ok); } .error .bar > i { background:var(--err); }
+  .errbox { display:flex; gap:10px; align-items:flex-start; justify-content:space-between; margin-top:6px; padding:8px 10px; border-radius:8px; background:color-mix(in srgb, var(--err) 12%, transparent); border:1px solid color-mix(in srgb, var(--err) 40%, transparent); color:var(--err); font-size:13px; }
+  .errbox span { flex:1; min-width:0; overflow-wrap:anywhere; }
+  .banner { margin-bottom:12px; padding:10px 12px; border-radius:8px; background:color-mix(in srgb, var(--err) 14%, transparent); border:1px solid color-mix(in srgb, var(--err) 45%, transparent); color:var(--err); font-size:14px; }
   a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
   .empty { color:var(--muted); }
   details { margin-top:8px; } summary { cursor:pointer; font-size:13px; color:var(--accent); }
@@ -65,6 +68,7 @@
   </form>
 
   <div id="app" hidden>
+    <div class="banner" id="netBanner" role="alert" hidden>⚠ Lost connection to your PC. Check that the downloader app is running and the tunnel is open. Retrying…</div>
     <form class="card" id="form">
       <div class="row">
         <input type="text" id="url" placeholder="https://… or magnet:?xt=…" autocomplete="off" required>
@@ -184,8 +188,9 @@ function renderJobs() {
     <div class="job ${j.status}">
       <div class="top"><div class="name" title="${esc(j.url)}">${esc(j.name || j.url)}</div>
         ${['done','error','cancelled'].includes(j.status) ? '' : `<button class="small" data-cancel="${j.id}">Cancel</button>`}</div>
-      <div class="meta">${esc(j.kind)} · ${esc(j.status)}${j.progress ? ' · ' + j.progress.toFixed(1) + '%' : ''}${j.speed ? ' · ' + esc(j.speed) : ''}${j.eta ? ' · ETA ' + esc(j.eta) : ''}${j.error ? ' · ' + esc(j.error) : ''}
+      <div class="meta">${esc(j.kind)} · ${esc(j.status)}${j.progress ? ' · ' + j.progress.toFixed(1) + '%' : ''}${j.speed ? ' · ' + esc(j.speed) : ''}${j.eta ? ' · ETA ' + esc(j.eta) : ''}
         ${j.status === 'done' && j.file && j.kind !== 'torrent' ? ' · <a href="' + esc(fileUrl(j.file)) + '" download>Save</a>' : ''}</div>
+      ${j.status === 'error' ? `<div class="errbox" role="alert"><span>⚠ ${esc(j.error || 'Something went wrong.')}</span><button class="small" data-retry="${j.id}">Retry</button></div>` : ''}
       <div class="bar"><i style="width:${Math.min(100, j.progress || 0)}%"></i></div>
       ${filesHtml(j)}
     </div>`).join('') : 'Nothing yet.';
@@ -206,16 +211,32 @@ async function loadFiles() {
       <button class="small" data-del="${esc(f.name)}">Delete</button></div></div></div>`).join('') : 'No files.';
 }
 
-$('form').addEventListener('submit', async (e) => {
-  e.preventDefault(); $('msg').textContent = '';
-  const r = await postJson('/api/download', { url: $('url').value, format: $('format').value });
+async function submitLink(url) {
+  $('msg').textContent = '';
+  if (!url.trim()) { $('msg').textContent = 'Paste a link first.'; return false; }
+  let r;
+  try { r = await postJson('/api/download', { url, format: $('format').value }); }
+  catch { $('msg').textContent = 'Cannot reach your PC. Check that the downloader app is running and, on a phone, that the tunnel is open.'; return false; }
   const data = await json(r);
-  if (!r.ok) { $('msg').textContent = data?.error || 'Request failed'; return; }
-  jobs.set(data.id, data); renderJobs(); $('url').value = '';
+  if (!r.ok) { $('msg').textContent = r.status === 401 ? 'You are signed out. Enter the PIN again.' : (data?.error || `The request failed (HTTP ${r.status}).`); return false; }
+  jobs.set(data.id, data); renderJobs(); return true;
+}
+$('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (await submitLink($('url').value)) $('url').value = '';
 });
 
+// connection watchdog: tell the user when the PC stops answering
+let missed = 0;
+setInterval(async () => {
+  if (!started) return;
+  try { const r = await fetch(BASE + '/api/ping', { cache: 'no-store' }); if (!r.ok) throw 0; missed = 0; } catch { missed++; }
+  $('netBanner').hidden = missed < 2;
+}, 5000);
+
 document.addEventListener('click', async (e) => {
-  const c = e.target.dataset.cancel, d = e.target.dataset.del;
+  const c = e.target.dataset.cancel, d = e.target.dataset.del, rt = e.target.dataset.retry;
+  if (rt && jobs.get(rt)) { const u = jobs.get(rt).url; if (await submitLink(u)) { jobs.delete(rt); renderJobs(); } }
   if (c) await api('/api/cancel/' + c, { method: 'POST' });
   if (d && confirm('Delete ' + d + '?')) { await api('/api/files?name=' + encodeURIComponent(d), { method: 'DELETE' }); loadFiles(); }
 });
