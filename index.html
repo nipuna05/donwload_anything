@@ -45,6 +45,11 @@
   dialog::backdrop { background:rgba(0,0,0,.45); }
   .dirrow { padding:8px 12px; cursor:pointer; border-top:1px solid var(--line); } .dirrow:first-child { border-top:0; } .dirrow:hover { background:var(--bg); }
   .pin { font:700 22px/1 ui-monospace,Consolas,monospace; letter-spacing:3px; }
+  .chooser { margin-top:8px; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .frow.pick { cursor:pointer; } .frow.pick:hover { background:var(--bg); } .frow.pick input { flex:none; }
+  .frow.skipped { opacity:.5; }
+  .outputs { margin-top:8px; border:1px solid var(--line); border-radius:8px; padding:6px 0; } .outputs > .meta { padding:0 10px 4px; }
+  .warnbox { margin-top:6px; padding:8px 10px; border-radius:8px; font-size:13px; background:color-mix(in srgb, #d99a1c 14%, transparent); border:1px solid color-mix(in srgb, #d99a1c 45%, transparent); color:var(--text); overflow-wrap:anywhere; }
   [hidden] { display:none !important; }
 </style>
 </head>
@@ -166,34 +171,74 @@ $('disconnect').onclick = (e) => { e.preventDefault(); store.del('token'); store
 
 // ---------- jobs ----------
 const jobs = new Map(), openJobs = new Set(), scrolls = new Map();
+const picks = new Map(); // torrent choices per job: which files, what to convert to
+let lastJobsHtml = '';
+
+// The panel shown once a torrent's file list has arrived: pick files, pick an output, then start.
+function chooserHtml(j) {
+  if (!picks.has(j.id)) picks.set(j.id, { sel: new Set(j.files.map((f) => f.i)), convert: 'none', del: false });
+  const p = picks.get(j.id);
+  const total = j.filesTotal || j.files.length;
+  const bytes = j.files.filter((f) => p.sel.has(f.i)).reduce((a, f) => a + f.size, 0);
+  return `<div class="chooser">
+    <div class="top"><b>Choose what to download</b><span class="meta">${p.sel.size} of ${total} selected · ${size(bytes)}</span></div>
+    <div class="row" style="margin:8px 0 6px"><button type="button" class="small" data-selall="${j.id}">Select all</button><button type="button" class="small" data-selnone="${j.id}">Select none</button></div>
+    <div class="flist" data-job="${j.id}">${j.files.map((f) => `
+      <label class="frow pick"><input type="checkbox" data-pick="${j.id}" data-i="${f.i}" ${p.sel.has(f.i) ? 'checked' : ''}>
+        <span class="fname" title="${esc(f.path)}">${esc(f.path)}</span><span class="meta">${size(f.size)}</span></label>`).join('')}
+      ${total > j.files.length ? `<div class="meta" style="padding:6px 10px">…and ${total - j.files.length} more files not shown (use Download all)</div>` : ''}
+    </div>
+    <div class="row" style="margin-top:10px;align-items:center">
+      <span class="meta">After downloading:</span>
+      <select data-convert="${j.id}" style="padding:6px 10px">
+        <option value="none" ${p.convert === 'none' ? 'selected' : ''}>Keep files as they are</option>
+        <option value="mp4" ${p.convert === 'mp4' ? 'selected' : ''}>Convert videos to MP4</option>
+        <option value="mp3" ${p.convert === 'mp3' ? 'selected' : ''}>Extract audio as MP3</option>
+      </select>
+      <label class="meta" style="${p.convert === 'none' ? 'display:none' : ''}"><input type="checkbox" data-delorig="${j.id}" ${p.del ? 'checked' : ''}> delete the originals afterwards</label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button type="button" class="primary" data-startall="${j.id}">Download all (${total})</button>
+      <button type="button" data-startsel="${j.id}" ${p.sel.size ? '' : 'disabled'}>Download selected (${p.sel.size})</button>
+    </div></div>`;
+}
+
 function filesHtml(j) {
   if (!j.files || !j.files.length) return '';
-  const done = j.files.filter((f) => f.progress >= 1).length;
+  if (j.status === 'choose files') return chooserHtml(j);
+  const wanted = j.files.filter((f) => f.sel !== false);
+  const done = wanted.filter((f) => f.progress >= 1).length;
   const total = j.filesTotal || j.files.length;
-  const sum = j.files.reduce((a, f) => a + f.size, 0);
+  const sum = wanted.reduce((a, f) => a + f.size, 0);
+  const skipped = j.files.length - wanted.length;
   return `<details data-job="${j.id}" ${openJobs.has(j.id) ? 'open' : ''}>
-    <summary>📂 ${esc(j.name)} — ${total} file${total > 1 ? 's' : ''}, ${size(sum)} (${done} complete)</summary>
-    <div class="flist" data-job="${j.id}">${j.files.map((f) => `
+    <summary>📂 ${esc(j.name)} — ${wanted.length} of ${total} file${total > 1 ? 's' : ''}, ${size(sum)} (${done} complete${skipped ? `, ${skipped} skipped` : ''})</summary>
+    <div class="flist" data-job="${j.id}">${j.files.map((f) => f.sel === false ? `
+      <div class="frow skipped"><span class="fname" title="${esc(f.path)}">${esc(f.path)}</span><span class="meta">skipped</span></div>` : `
       <div class="frow"><span class="fname" title="${esc(f.path)}">${esc(f.path)}</span>
         <span class="meta">${size(f.size)} · ${Math.floor(f.progress * 100)}%</span>
         ${f.progress >= 1 ? `<a href="${esc(fileUrl(f.path))}" download>Save</a>` : ''}</div>`).join('')}
       ${total > j.files.length ? `<div class="meta">…and ${total - j.files.length} more</div>` : ''}
-    </div></details>`;
+    </div></details>
+    ${(j.outputs || []).length ? `<div class="outputs"><div class="meta">${j.convert === 'mp3' ? '🎵 Converted to MP3' : '🎬 Converted to MP4'}</div>${j.outputs.map((o) => `
+      <div class="frow"><span class="fname" title="${esc(o.path)}">${esc(o.path)}</span><span class="meta">${size(o.size)}</span><a href="${esc(fileUrl(o.path))}" download>Save</a></div>`).join('')}</div>` : ''}`;
 }
 function renderJobs() {
   document.querySelectorAll('.flist').forEach((el) => scrolls.set(el.dataset.job, el.scrollTop));
   const list = [...jobs.values()].reverse();
   $('jobs').className = list.length ? '' : 'empty';
-  $('jobs').innerHTML = list.length ? list.map((j) => `
-    <div class="job ${j.status}">
+  const html = list.length ? list.map((j) => `
+    <div class="job ${j.status === 'choose files' ? 'choosing' : j.status}">
       <div class="top"><div class="name" title="${esc(j.url)}">${esc(j.name || j.url)}</div>
         ${['done','error','cancelled'].includes(j.status) ? '' : `<button class="small" data-cancel="${j.id}">Cancel</button>`}</div>
-      <div class="meta">${esc(j.kind)} · ${esc(j.status)}${j.progress ? ' · ' + j.progress.toFixed(1) + '%' : ''}${j.speed ? ' · ' + esc(j.speed) : ''}${j.eta ? ' · ETA ' + esc(j.eta) : ''}
+      <div class="meta">${esc(j.kind)} · ${esc(j.status)}${j.stage ? ' · ' + esc(j.stage) : ''}${j.progress ? ' · ' + j.progress.toFixed(1) + '%' : ''}${j.speed ? ' · ' + esc(j.speed) : ''}${j.eta ? ' · ETA ' + esc(j.eta) : ''}
         ${j.status === 'done' && j.file && j.kind !== 'torrent' ? ' · <a href="' + esc(fileUrl(j.file)) + '" download>Save</a>' : ''}</div>
       ${j.status === 'error' ? `<div class="errbox" role="alert"><span>⚠ ${esc(j.error || 'Something went wrong.')}</span><button class="small" data-retry="${j.id}">Retry</button></div>` : ''}
+      ${j.warn ? `<div class="warnbox" role="status"><span>ℹ ${esc(j.warn)}</span></div>` : ''}
       <div class="bar"><i style="width:${Math.min(100, j.progress || 0)}%"></i></div>
       ${filesHtml(j)}
     </div>`).join('') : 'Nothing yet.';
+  if (html !== lastJobsHtml) { lastJobsHtml = html; $('jobs').innerHTML = html; } // unchanged -> leave the page alone (keeps menus and scroll)
   document.querySelectorAll('.flist').forEach((el) => { el.scrollTop = scrolls.get(el.dataset.job) || 0; });
 }
 document.addEventListener('toggle', (e) => {
@@ -215,7 +260,7 @@ async function submitLink(url) {
   $('msg').textContent = '';
   if (!url.trim()) { $('msg').textContent = 'Paste a link first.'; return false; }
   let r;
-  try { r = await postJson('/api/download', { url, format: $('format').value }); }
+  try { r = await postJson('/api/download', { url, format: $('format').value, choose: true }); }
   catch { $('msg').textContent = 'Cannot reach your PC. Check that the downloader app is running and, on a phone, that the tunnel is open.'; return false; }
   const data = await json(r);
   if (!r.ok) { $('msg').textContent = r.status === 401 ? 'You are signed out. Enter the PIN again.' : (data?.error || `The request failed (HTTP ${r.status}).`); return false; }
@@ -234,7 +279,30 @@ setInterval(async () => {
   $('netBanner').hidden = missed < 2;
 }, 5000);
 
+// torrent chooser: remember ticks / output choice, and start
+async function startTorrent(id, files) {
+  const p = picks.get(id); if (!p) return;
+  let r;
+  try { r = await postJson('/api/torrent/' + id + '/start', { files, convert: p.convert, deleteOriginal: p.convert !== 'none' && p.del }); }
+  catch { $('msg').textContent = 'Cannot reach your PC. Check that the downloader app is running.'; return; }
+  const d = await json(r);
+  if (!r.ok) { $('msg').textContent = d?.error || `The request failed (HTTP ${r.status}).`; return; }
+  $('msg').textContent = ''; jobs.set(d.id, d); renderJobs();
+}
+document.addEventListener('change', (e) => {
+  const t = e.target, p = picks.get(t.dataset.pick || t.dataset.convert || t.dataset.delorig);
+  if (!p) return;
+  if (t.dataset.pick) { const i = Number(t.dataset.i); t.checked ? p.sel.add(i) : p.sel.delete(i); }
+  else if (t.dataset.convert) p.convert = t.value;
+  else if (t.dataset.delorig) p.del = t.checked;
+  renderJobs();
+});
+
 document.addEventListener('click', async (e) => {
+  const sa = e.target.dataset.selall, sn = e.target.dataset.selnone, st = e.target.dataset.startall, ss = e.target.dataset.startsel;
+  if (sa || sn) { const p = picks.get(sa || sn), j = jobs.get(sa || sn); if (p && j) { p.sel = new Set(sa ? j.files.map((f) => f.i) : []); renderJobs(); } return; }
+  if (st) return startTorrent(st, 'all');
+  if (ss) return startTorrent(ss, [...picks.get(ss).sel]);
   const c = e.target.dataset.cancel, d = e.target.dataset.del, rt = e.target.dataset.retry;
   if (rt && jobs.get(rt)) { const u = jobs.get(rt).url; if (await submitLink(u)) { jobs.delete(rt); renderJobs(); } }
   if (c) await api('/api/cancel/' + c, { method: 'POST' });
